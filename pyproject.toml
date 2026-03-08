@@ -45,6 +45,9 @@ dependencies = [
     # Python: plotting libraries (optional)
     "plotly>=6.5,<7",
     "bqplot",
+
+    # Deploy extension (isomorphic-git in-browser push to gh-pages)
+    "jupyterlite-deploy @ file:packages/jupyterlite-deploy",
 ]
 
 [build-system]

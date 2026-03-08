@@ -2,10 +2,15 @@
     "name": "JupyterLite Demo",
     // If we `pip install .` in the `postCreateCommand` we don't get the extensions.  Why?"
     // Either way the devcontainer image is better than plain python because we get git."
-    // "image": "mcr.microsoft.com/devcontainers/python:3.13",
-     "build": {
-        "dockerfile": "Dockerfile",
-        "context": ".."
+    "image": "mcr.microsoft.com/devcontainers/python:3.13",
+    //  "build": {
+    //     "dockerfile": "Dockerfile",
+    //     "context": ".."
+    // },
+    "features": {
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "20"
+        }
     },
     "customizations": {
         "vscode": {
@@ -17,7 +22,6 @@
                 "python.defaultInterpreterPath": "/usr/local/bin/python"
             }
         }
-    },
-    // "postCreateCommand": "pip install . && jupyter lite build"
-    "postCreateCommand": "jupyter lite build"
+    }
+    // "postCreateCommand": "pip install -e . && jupyter lite build"
 }

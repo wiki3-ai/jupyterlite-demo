@@ -114,3 +114,9 @@ dmypy.json
 # jupyterlite
 *.doit.db
 _output
+
+# jupyterlite-deploy extension build artifacts
+.yarn/
+yarn.lock
+jupyterlite_deploy/labextension/
+jupyterlite_deploy/_version.py

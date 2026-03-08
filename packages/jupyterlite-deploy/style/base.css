@@ -1,0 +1,32 @@
+.jl-deploy-dialog .jp-Dialog-body {
+  min-width: 400px;
+}
+
+.jl-deploy-dialog label {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.jl-deploy-dialog input[type='text'],
+.jl-deploy-dialog input[type='password'] {
+  width: 100%;
+  padding: 6px 8px;
+  margin-bottom: 12px;
+  border: 1px solid var(--jp-border-color1);
+  border-radius: 2px;
+  font-size: var(--jp-ui-font-size1);
+  background: var(--jp-layout-color1);
+  color: var(--jp-ui-font-color0);
+}
+
+.jl-deploy-status {
+  padding: 8px;
+  margin-top: 8px;
+  border-radius: 2px;
+  font-family: var(--jp-code-font-family);
+  font-size: var(--jp-code-font-size);
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow-y: auto;
+}

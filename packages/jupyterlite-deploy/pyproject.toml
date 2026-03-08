@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.5.0", "jupyterlab>=4.0.0,<5", "hatch-nodejs-version>=0.3.2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jupyterlite-deploy"
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.8"
+description = "Deploy JupyterLite sites to GitHub Pages using isomorphic-git"
+dynamic = ["version"]
+
+[tool.hatch.version]
+source = "nodejs"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.sdist]
+artifacts = ["jupyterlite_deploy/labextension"]
+exclude = [".github", "node_modules"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"jupyterlite_deploy/labextension" = "share/jupyter/labextensions/jupyterlite-deploy"
+"install.json" = "share/jupyter/labextensions/jupyterlite-deploy/install.json"
+
+[tool.hatch.build.hooks.version]
+path = "jupyterlite_deploy/_version.py"
+
+[tool.hatch.build.hooks.jupyter-builder]
+dependencies = ["hatch-jupyter-builder>=0.5"]
+build-function = "hatch_jupyter_builder.npm_builder"
+ensured-targets = [
+    "jupyterlite_deploy/labextension/static/style.js",
+]
+skip-if-exists = [
+    "jupyterlite_deploy/labextension/static/style.js",
+]
+
+[tool.hatch.build.hooks.jupyter-builder.build-kwargs]
+build_cmd = "build:prod"
+npm = ["jlpm"]
+
+[tool.hatch.build.hooks.jupyter-builder.editable-build-kwargs]
+build_cmd = "install:extension"
+npm = ["jlpm"]
+source_dir = "src"
+build_dir = "jupyterlite_deploy/labextension"
