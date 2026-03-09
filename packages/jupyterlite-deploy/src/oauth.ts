@@ -16,7 +16,7 @@
 export interface IOAuthConfig {
   /** Base URL of the CORS proxy worker */
   proxyUrl: string;
-  /** Requested OAuth scope (default: "repo") */
+  /** Requested OAuth scope (default: "public_repo") */
   scope?: string;
 }
 
@@ -43,7 +43,7 @@ export async function requestDeviceCode(
   const resp = await fetch(`${config.proxyUrl}/oauth/device`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ scope: config.scope ?? 'repo' }),
+    body: JSON.stringify({ scope: config.scope ?? 'public_repo' }),
   });
 
   if (!resp.ok) {

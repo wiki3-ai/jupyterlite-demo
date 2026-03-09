@@ -138,7 +138,7 @@ async function handleProxy(request: Request, url: URL): Promise<Response> {
 /**
  * Step 1: Request a device code from GitHub.
  * POST /oauth/device
- * Body: { "scope": "repo" }         (optional, defaults to "repo")
+ * Body: { "scope": "public_repo" }   (optional, defaults to "public_repo")
  *
  * Returns: { device_code, user_code, verification_uri, expires_in, interval }
  */
@@ -150,7 +150,7 @@ async function handleDeviceCode(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: 'OAuth not configured (missing GITHUB_CLIENT_ID)' }, 500);
   }
 
-  let scope = 'repo';
+  let scope = 'public_repo';
   try {
     const body = await request.json() as Record<string, string>;
     if (body.scope) scope = body.scope;
