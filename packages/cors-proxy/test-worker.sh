@@ -120,9 +120,14 @@ fi
 echo ""
 
 # ── 4. Git proxy — allowed route ────────────────────────────────────
-echo "4. Git proxy — allowed route (/proxy/ → github.com)"
-check_status "info/refs returns 200" \
+echo "4. Git proxy — allowed routes (/proxy/ → github.com)"
+check_status "info/refs with .git returns 200" \
   "$WORKER_URL/proxy/wiki3-ai/jupyterlite-demo.git/info/refs?service=git-upload-pack" "200"
+
+# Also test without .git suffix (isomorphic-git sends URLs this way)
+check_status "info/refs without .git returns 200" \
+  "$WORKER_URL/proxy/wiki3-ai/jupyterlite-demo/info/refs?service=git-upload-pack" "200"
+
 check_cors_header "Proxy CORS header" \
   "$WORKER_URL/proxy/wiki3-ai/jupyterlite-demo.git/info/refs?service=git-upload-pack"
 
@@ -140,14 +145,24 @@ echo ""
 # ── 5. Route allowlist — blocked routes ──────────────────────────────
 echo "5. Route allowlist — blocked routes"
 
-# git-receive-pack should be blocked
+# git-receive-pack should be blocked (with .git)
 status=$(curl -s -o /dev/null -w '%{http_code}' \
   -H "Origin: $ORIGIN" \
   "$WORKER_URL/proxy/wiki3-ai/jupyterlite-demo.git/info/refs?service=git-receive-pack")
 if [[ "$status" == "403" ]]; then
-  pass "git-receive-pack blocked (403)"
+  pass "git-receive-pack blocked with .git (403)"
 else
   fail "git-receive-pack should be 403, got $status"
+fi
+
+# git-receive-pack should be blocked (without .git too)
+status=$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "Origin: $ORIGIN" \
+  "$WORKER_URL/proxy/wiki3-ai/jupyterlite-demo/info/refs?service=git-receive-pack")
+if [[ "$status" == "403" ]]; then
+  pass "git-receive-pack blocked without .git (403)"
+else
+  fail "git-receive-pack (no .git) should be 403, got $status"
 fi
 
 # DELETE on refs should be blocked

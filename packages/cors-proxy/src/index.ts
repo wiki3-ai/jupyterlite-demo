@@ -11,9 +11,9 @@
  *   /oauth/status       → Health check
  *
  * Allowed proxy operations:
- *   Pull (git smart HTTP):
- *     GET  /<owner>/<repo>.git/info/refs?service=git-upload-pack
- *     POST /<owner>/<repo>.git/git-upload-pack
+ *   Pull (git smart HTTP — .git suffix optional):
+ *     GET  /<owner>/<repo>[.git]/info/refs?service=git-upload-pack
+ *     POST /<owner>/<repo>[.git]/git-upload-pack
  *   Push (Git Data API):
  *     GET   /repos/<o>/<r>/git/ref/<ref>
  *     GET   /repos/<o>/<r>/git/refs/<prefix>
@@ -124,7 +124,8 @@ function isAllowedProxyRoute(
   // ── github.com: git smart HTTP (clone/pull only) ────────────────
   if (host === 'github.com') {
     // Discovery: info/refs (only git-upload-pack, NOT git-receive-pack)
-    if (method === 'GET' && /^\/[^/]+\/[^/]+\.git\/info\/refs$/.test(path)) {
+    // .git suffix is optional — GitHub accepts both /owner/repo/info/refs and /owner/repo.git/info/refs
+    if (method === 'GET' && /^\/[^/]+\/[^/]+(\.git)?\/info\/refs$/.test(path)) {
       const service = parsed.searchParams.get('service');
       if (service === 'git-upload-pack') {
         return { allowed: true };
@@ -132,7 +133,7 @@ function isAllowedProxyRoute(
       return { allowed: false, reason: `Blocked git service: ${service}` };
     }
     // Pack negotiation (clone/fetch — read only)
-    if (method === 'POST' && /^\/[^/]+\/[^/]+\.git\/git-upload-pack$/.test(path)) {
+    if (method === 'POST' && /^\/[^/]+\/[^/]+(\.git)?\/git-upload-pack$/.test(path)) {
       return { allowed: true };
     }
     // Block everything else on github.com (including git-receive-pack)
