@@ -39,6 +39,7 @@
     "watch:labextension": "jupyter labextension watch ."
   },
   "dependencies": {
+    "buffer": "^6.0.3",
     "isomorphic-git": "^1.27.1"
   },
   "devDependencies": {
@@ -65,7 +66,7 @@
     "extension": true,
     "outputDir": "jupyterlite_deploy/labextension",
     "_build": {
-      "load": "static/remoteEntry.6304ecb1fe91e035f806.js",
+      "load": "static/remoteEntry.5509650343d0c9d1c0da.js",
       "extension": "./extension",
       "style": "./style"
     }

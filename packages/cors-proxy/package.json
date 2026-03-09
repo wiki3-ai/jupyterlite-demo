@@ -1,0 +1,17 @@
+{
+  "name": "wiki3-ai-sync-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Wiki3.ai Sync — Cloudflare Worker CORS proxy + GitHub OAuth Device Flow",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "@cloudflare/workers-types": "^4.0.0",
+    "typescript": "~5.0.2"
+  }
+}

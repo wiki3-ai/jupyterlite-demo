@@ -5,6 +5,12 @@
  * to push files from the Contents API to a gh-pages branch.
  */
 
+// Polyfill Buffer for isomorphic-git (webpack 5 doesn't auto-polyfill Node globals)
+import { Buffer } from 'buffer';
+if (typeof (globalThis as any).Buffer === 'undefined') {
+  (globalThis as any).Buffer = Buffer;
+}
+
 import {
   JupyterFrontEnd,
   JupyterFrontEndPlugin,

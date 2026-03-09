@@ -39,6 +39,7 @@
     "watch:labextension": "jupyter labextension watch ."
   },
   "dependencies": {
+    "buffer": "^6.0.3",
     "isomorphic-git": "^1.27.1"
   },
   "devDependencies": {
