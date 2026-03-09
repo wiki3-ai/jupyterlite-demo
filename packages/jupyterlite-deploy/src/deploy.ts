@@ -1,6 +1,7 @@
 /**
- * Core deploy logic: collect files, build a git tree in-memory,
- * commit, and force-push to a remote branch using isomorphic-git.
+ * Core push logic: uses GitHub's Git Data API (Trees/Blobs/Commits/Refs)
+ * to update only the files/ subdirectory without downloading existing
+ * site content. Zero download of blobs — only uploads new/changed files.
  */
 
 import git from 'isomorphic-git';
@@ -8,7 +9,7 @@ import { makeProxyHttp } from './proxy-http';
 import { MemFS } from './memfs';
 import { Contents } from '@jupyterlab/services';
 
-/** Options for a deploy operation. */
+/** Options for a push operation. */
 export interface IDeployOptions {
   /** Full HTTPS repo URL, e.g. https://github.com/user/repo.git */
   repoUrl: string;
@@ -36,11 +37,75 @@ export interface IFileEntry {
   content: Uint8Array;
 }
 
+// ── GitHub API helpers ──────────────────────────────────────────────
+
+/** Parse "owner" and "repo" from a GitHub URL. */
+function parseGitHubUrl(repoUrl: string): { owner: string; repo: string } {
+  // Handle https://github.com/owner/repo.git or https://github.com/owner/repo
+  const m = repoUrl.match(/github\.com[/:]([^/]+)\/([^/.]+)/);
+  if (!m) {
+    throw new Error(`Cannot parse owner/repo from URL: ${repoUrl}`);
+  }
+  return { owner: m[1], repo: m[2] };
+}
+
+/** Build the base API URL, routing through the CORS proxy if provided. */
+function apiUrl(proxyUrl: string | undefined, path: string): string {
+  const base = `https://api.github.com${path}`;
+  if (proxyUrl) {
+    return `${proxyUrl}/proxy/${base}`;
+  }
+  return base;
+}
+
+/** Authenticated fetch to GitHub API. */
+async function ghFetch(
+  url: string,
+  token: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    ...(options.headers as Record<string, string> || {}),
+  };
+  const resp = await fetch(url, { ...options, headers });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`GitHub API error (${resp.status}): ${body}`);
+  }
+  return resp;
+}
+
+// ── Git Data API types ──────────────────────────────────────────────
+
+interface IGitTreeEntry {
+  path: string;
+  mode: string;
+  type: string;
+  sha: string;
+  size?: number;
+}
+
+interface IGitTreeResponse {
+  sha: string;
+  tree: IGitTreeEntry[];
+  truncated: boolean;
+}
+
 /**
- * Deploy a set of files to a remote branch via isomorphic-git.
+ * Push content files to a remote branch using the GitHub Git Data API.
  *
- * This creates a fresh in-memory repo, writes all files, commits, and
- * force-pushes to the specified branch — completely replacing its contents.
+ * This avoids cloning entirely. Instead it:
+ *   1. Reads the current branch ref → commit SHA → tree SHA
+ *   2. Gets the recursive tree (just SHA references, no blob content)
+ *   3. Computes blob SHAs locally, uploads only new/changed blobs
+ *   4. Creates a new tree with updated entries under files/
+ *   5. Creates a commit and updates the branch ref
+ *
+ * The only data transferred is the new/changed file content (upload).
+ * No existing site content (build/, static/, etc.) is downloaded.
  */
 export async function deployToGitHub(
   files: IFileEntry[],
@@ -58,69 +123,244 @@ export async function deployToGitHub(
   } = options;
 
   const log = (msg: string) => onProgress?.(msg);
-  const http = makeProxyHttp(proxyUrl);
-  const fs = new MemFS();
-  const dir = '/repo';
+  const { owner, repo } = parseGitHubUrl(repoUrl);
+  const repoPath = `/repos/${owner}/${repo}`;
 
-  log(`Initializing in-memory repository…`);
-  await git.init({ fs, dir });
+  // ── 1. Get current branch HEAD ────────────────────────────────────
+  log(`Reading ${branch} ref…`);
+  let parentCommitSha: string | null = null;
+  let baseTreeSha: string | null = null;
 
-  // Configure remote
-  await git.addRemote({ fs, dir, remote: 'origin', url: repoUrl });
+  try {
+    const refResp = await ghFetch(
+      apiUrl(proxyUrl, `${repoPath}/git/ref/heads/${branch}`),
+      token
+    );
+    const refData = await refResp.json() as { object: { sha: string } };
+    parentCommitSha = refData.object.sha;
 
-  // Write all files into the working tree
-  log(`Writing ${files.length} files…`);
-  for (const file of files) {
-    const filepath = file.path;
-    // Ensure parent dirs exist in the MemFS
-    const parts = filepath.split('/');
-    let cur = dir;
-    for (let i = 0; i < parts.length - 1; i++) {
-      cur += '/' + parts[i];
-      try {
-        await fs.promises.mkdir(cur);
-      } catch {
-        // dir already exists
-      }
+    // Get the commit to find its tree
+    const commitResp = await ghFetch(
+      apiUrl(proxyUrl, `${repoPath}/git/commits/${parentCommitSha}`),
+      token
+    );
+    const commitData = await commitResp.json() as { tree: { sha: string } };
+    baseTreeSha = commitData.tree.sha;
+    log(`Current HEAD: ${parentCommitSha.slice(0, 8)}, tree: ${baseTreeSha.slice(0, 8)}`);
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes('404') || errMsg.includes('Not Found')) {
+      log(`Branch "${branch}" does not exist — will create it.`);
+    } else {
+      throw err;
     }
-    await fs.promises.writeFile(dir + '/' + filepath, file.content);
   }
 
-  // Add a .nojekyll so GitHub Pages serves files as-is
-  await fs.promises.writeFile(dir + '/.nojekyll', new Uint8Array(0));
-
-  // Stage all files
-  log('Staging files…');
-  const allPaths = await listAllFiles(fs, dir, '');
-  for (const p of allPaths) {
-    await git.add({ fs, dir, filepath: p });
+  // ── 2. Get existing tree (SHA references only, no blob content) ───
+  let existingTree: IGitTreeEntry[] = [];
+  if (baseTreeSha) {
+    log('Reading existing tree…');
+    const treeResp = await ghFetch(
+      apiUrl(proxyUrl, `${repoPath}/git/trees/${baseTreeSha}?recursive=1`),
+      token
+    );
+    const treeData = await treeResp.json() as IGitTreeResponse;
+    existingTree = treeData.tree;
+    if (treeData.truncated) {
+      log('  Warning: tree was truncated (very large repo)');
+    }
+    log(`  ${existingTree.length} entries in existing tree`);
   }
 
-  // Commit
+  // Build a map of existing file paths → SHA for quick lookup
+  const existingBlobShas = new Map<string, string>();
+  for (const entry of existingTree) {
+    if (entry.type === 'blob') {
+      existingBlobShas.set(entry.path, entry.sha);
+    }
+  }
+
+  // ── 3. Compute blob SHAs locally, upload only new/changed blobs ───
+  log(`Processing ${files.length} content file(s)…`);
+  const newTreeEntries: Array<{
+    path: string;
+    mode: string;
+    type: string;
+    sha: string;
+  }> = [];
+
+  let uploaded = 0;
+  let skipped = 0;
+
+  for (const file of files) {
+    const repoPath_ = 'files/' + file.path;
+    // Compute the git blob SHA (same algorithm git uses)
+    const blobSha = await computeBlobSha(file.content);
+
+    if (existingBlobShas.get(repoPath_) === blobSha) {
+      // File unchanged — reuse existing SHA, no upload needed
+      skipped++;
+      continue;
+    }
+
+    // Upload the blob
+    const blobResp = await ghFetch(
+      apiUrl(proxyUrl, `${repoPath}/git/blobs`),
+      token,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: uint8ArrayToBase64(file.content),
+          encoding: 'base64',
+        }),
+      }
+    );
+    const blobData = await blobResp.json() as { sha: string };
+    uploaded++;
+    log(`  ↑ files/${file.path} (${formatBytes(file.content.length)})`);
+
+    newTreeEntries.push({
+      path: repoPath_,
+      mode: '100644',
+      type: 'blob',
+      sha: blobData.sha,
+    });
+  }
+
+  if (uploaded === 0) {
+    log(`No files changed (${skipped} identical) — nothing to push.`);
+    return;
+  }
+
+  log(`${uploaded} file(s) uploaded, ${skipped} unchanged.`);
+
+  // ── 4. Create new tree ────────────────────────────────────────────
+  log('Creating tree…');
+  const treeBody: Record<string, unknown> = {
+    tree: newTreeEntries,
+  };
+  if (baseTreeSha) {
+    // base_tree preserves all existing entries not listed in `tree`
+    treeBody.base_tree = baseTreeSha;
+  }
+
+  const newTreeResp = await ghFetch(
+    apiUrl(proxyUrl, `/repos/${owner}/${repo}/git/trees`),
+    token,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(treeBody),
+    }
+  );
+  const newTreeData = await newTreeResp.json() as { sha: string };
+  log(`  New tree: ${newTreeData.sha.slice(0, 8)}`);
+
+  // ── 5. Create commit ──────────────────────────────────────────────
   log('Creating commit…');
-  const sha = await git.commit({
-    fs,
-    dir,
+  const now = new Date().toISOString();
+  const commitBody: Record<string, unknown> = {
     message,
-    author: { name: authorName, email: authorEmail },
-  });
-  log(`Commit: ${sha.slice(0, 8)}`);
+    tree: newTreeData.sha,
+    author: {
+      name: authorName,
+      email: authorEmail,
+      date: now,
+    },
+  };
+  if (parentCommitSha) {
+    commitBody.parents = [parentCommitSha];
+  }
 
-  // Force-push to the target branch
-  log(`Pushing to ${branch}…`);
-  await git.push({
-    fs,
-    http,
-    dir,
-    remote: 'origin',
-    ref: 'HEAD',
-    remoteRef: `refs/heads/${branch}`,
-    force: true,
-    onAuth: () => ({ username: 'x-access-token', password: token }),
-    onMessage: (msg: string) => log(`  remote: ${msg}`),
-  });
+  const commitResp = await ghFetch(
+    apiUrl(proxyUrl, `/repos/${owner}/${repo}/git/commits`),
+    token,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(commitBody),
+    }
+  );
+  const commitData = await commitResp.json() as { sha: string };
+  log(`  Commit: ${commitData.sha.slice(0, 8)}`);
 
-  log('Deploy complete ✓');
+  // ── 6. Update branch ref ──────────────────────────────────────────
+  log(`Updating ${branch}…`);
+  if (parentCommitSha) {
+    // Branch exists — update it
+    await ghFetch(
+      apiUrl(proxyUrl, `/repos/${owner}/${repo}/git/refs/heads/${branch}`),
+      token,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sha: commitData.sha }),
+      }
+    );
+  } else {
+    // Branch doesn't exist — create it
+    await ghFetch(
+      apiUrl(proxyUrl, `/repos/${owner}/${repo}/git/refs`),
+      token,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ref: `refs/heads/${branch}`,
+          sha: commitData.sha,
+        }),
+      }
+    );
+  }
+
+  log('Push complete ✓');
+}
+
+// ── Blob SHA computation ────────────────────────────────────────────
+
+/**
+ * Compute the git blob SHA-1 for content.
+ * Git hashes: "blob <size>\0<content>"
+ */
+async function computeBlobSha(content: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`blob ${content.length}\0`);
+  const full = new Uint8Array(header.length + content.length);
+  full.set(header, 0);
+  full.set(content, header.length);
+
+  // Use Web Crypto API (available in browsers and workers)
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    const hashBuffer = await crypto.subtle.digest('SHA-1', full);
+    return Array.from(new Uint8Array(hashBuffer))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  // Fallback: use isomorphic-git's internal SHA function if available
+  // This shouldn't happen in browsers but provides a safety net
+  throw new Error('SHA-1 not available (no crypto.subtle)');
+}
+
+/** Convert Uint8Array to base64 string. */
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  // btoa works in browsers; for large files, process in chunks
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    for (let j = 0; j < chunk.length; j++) {
+      binary += String.fromCharCode(chunk[j]);
+    }
+  }
+  return btoa(binary);
+}
+
+/** Format bytes as human-readable string. */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**

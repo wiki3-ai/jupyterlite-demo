@@ -1,8 +1,8 @@
 /**
  * jupyterlite-deploy — JupyterLab/JupyterLite extension
  *
- * Adds a "Deploy to GitHub Pages" command that uses isomorphic-git
- * to push files from the Contents API to a gh-pages branch.
+ * Adds a "Push to GitHub Pages" command that uses isomorphic-git
+ * to push content files to a gh-pages branch.
  */
 
 // Polyfill Buffer for isomorphic-git (webpack 5 doesn't auto-polyfill Node globals)
@@ -67,12 +67,12 @@ function createDeployDialogBody(): HTMLElement {
 
     <label for="jl-deploy-author">Author</label>
     <input id="jl-deploy-author" type="text"
-           placeholder="Deploy Bot <deploy@example.com>"
-           value="${localStorage.getItem('jl-deploy-author') || 'Deploy Bot <deploy@example.com>'}" />
+           placeholder="Wiki3 Bot <deploy@wiki3.ai>"
+           value="${localStorage.getItem('jl-deploy-author') || 'Wiki3 Bot <deploy@wiki3.ai>'}" />
 
     <label for="jl-deploy-message">Commit message</label>
     <input id="jl-deploy-message" type="text"
-           value="Deploy JupyterLite site" />
+           value="Update content files" />
   `;
 
   // Wire up buttons
@@ -199,24 +199,24 @@ async function doOAuthLogin(
  */
 const plugin: JupyterFrontEndPlugin<void> = {
   id: 'jupyterlite-deploy:plugin',
-  description: 'Deploy JupyterLite sites to GitHub Pages using isomorphic-git',
+  description: 'Push content files to GitHub Pages using isomorphic-git',
   autoStart: true,
   optional: [ICommandPalette],
   activate: (app: JupyterFrontEnd, palette: ICommandPalette | null) => {
     console.log('jupyterlite-deploy: activated');
 
     app.commands.addCommand(CMD_DEPLOY, {
-      label: 'Wiki3.ai Sync: Deploy to GitHub Pages',
-      caption: 'Push site contents to a gh-pages branch via isomorphic-git',
+      label: 'Wiki3.ai Sync: Push to GitHub Pages',
+      caption: 'Push content files to a gh-pages branch via isomorphic-git',
       execute: async () => {
         // ── 1. Show config dialog ────────────────────────────────────
         const body = createDeployDialogBody();
         const dialogResult = await showDialog({
-          title: 'Deploy to GitHub Pages',
+          title: 'Push to GitHub Pages',
           body: new Widget({ node: body }),
           buttons: [
             Dialog.cancelButton(),
-            Dialog.okButton({ label: 'Deploy' }),
+            Dialog.okButton({ label: 'Push' }),
           ],
         });
 
@@ -245,7 +245,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
 
         if (!repoUrl || !token) {
           void showDialog({
-            title: 'Deploy Error',
+            title: 'Push Error',
             body: 'Repository URL and GitHub Token are required.',
             buttons: [Dialog.okButton()],
           });
@@ -275,9 +275,9 @@ const plugin: JupyterFrontEndPlugin<void> = {
         const statusWidget = new Widget({ node: statusNode });
 
         void showDialog({
-          title: 'Deploying…',
+          title: 'Pushing…',
           body: statusWidget,
-          buttons: [], // no user buttons while deploying
+          buttons: [], // no user buttons while pushing
         });
 
         const log = (msg: string) => {
@@ -292,12 +292,12 @@ const plugin: JupyterFrontEndPlugin<void> = {
           );
           log(`Collected ${files.length} file(s).`);
 
-          // ── 3. Deploy ────────────────────────────────────────────────
+          // ── 3. Push ──────────────────────────────────────────────
           await deployToGitHub(files, {
             repoUrl,
             branch: branch || 'gh-pages',
             token,
-            message: message || 'Deploy JupyterLite site',
+            message: message || 'Update content files',
             authorName,
             authorEmail,
             proxyUrl: proxyUrl || getProxyUrl(),
@@ -323,7 +323,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
         finalNode.classList.add('jl-deploy-status');
         finalNode.textContent = statusNode.textContent ?? '';
         await showDialog({
-          title: 'Deploy Result',
+          title: 'Push Result',
           body: new Widget({ node: finalNode }),
           buttons: [Dialog.okButton({ label: 'Close' })],
         });

@@ -66,7 +66,7 @@
     "extension": true,
     "outputDir": "jupyterlite_deploy/labextension",
     "_build": {
-      "load": "static/remoteEntry.586bc96e383a55db05a9.js",
+      "load": "static/remoteEntry.104c572d525f3e902358.js",
       "extension": "./extension",
       "style": "./style"
     }

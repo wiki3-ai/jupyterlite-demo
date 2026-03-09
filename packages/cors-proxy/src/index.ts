@@ -74,17 +74,36 @@ export default {
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Proxy a request to github.com, preserving method, headers, and body.
- * Path: /proxy/<owner>/<repo>.git/... → https://github.com/<owner>/<repo>.git/...
+ * Proxy a request to GitHub, preserving method, headers, and body.
+ *
+ * Supported path formats:
+ *   /proxy/<owner>/<repo>.git/...   → https://github.com/<owner>/<repo>.git/...
+ *   /proxy/https://api.github.com/... → https://api.github.com/...
+ *   /proxy/https://github.com/...     → https://github.com/...
+ *
+ * Only github.com and api.github.com are allowed as targets.
  */
 async function handleProxy(request: Request, url: URL): Promise<Response> {
-  // Strip "/proxy/" prefix to get the GitHub path
-  const githubPath = url.pathname.slice('/proxy/'.length);
-  if (!githubPath) {
+  // Strip "/proxy/" prefix to get the target path
+  const rawPath = url.pathname.slice('/proxy/'.length);
+  if (!rawPath) {
     return jsonResponse({ error: 'Missing path after /proxy/' }, 400);
   }
 
-  const targetUrl = `https://github.com/${githubPath}${url.search}`;
+  // Determine the target URL
+  let targetUrl: string;
+  if (rawPath.startsWith('https://')) {
+    // Full URL form: /proxy/https://api.github.com/repos/...
+    const parsed = new URL(rawPath + url.search);
+    const host = parsed.hostname;
+    if (host !== 'github.com' && host !== 'api.github.com') {
+      return jsonResponse({ error: `Proxy only supports github.com and api.github.com, got ${host}` }, 403);
+    }
+    targetUrl = rawPath + url.search;
+  } else {
+    // Short form: /proxy/<owner>/<repo>.git/... → github.com
+    targetUrl = `https://github.com/${rawPath}${url.search}`;
+  }
 
   // Forward relevant headers, skip host/origin/referer
   const forwardHeaders = new Headers();
