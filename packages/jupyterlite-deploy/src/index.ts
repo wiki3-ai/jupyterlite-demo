@@ -12,10 +12,13 @@ import {
 import { Dialog, ICommandPalette, showDialog } from '@jupyterlab/apputils';
 import { Widget } from '@lumino/widgets';
 import { deployToGitHub, collectContentsFiles, syncFromRepo, IFileEntry } from './deploy';
+import { getProxyUrl } from './proxy-http';
+import { requestDeviceCode, pollForToken, cacheToken } from './oauth';
 
 /** Command IDs */
 const CMD_DEPLOY = 'deploy:gh-pages';
 const CMD_SYNC = 'deploy:sync';
+const CMD_LOGIN = 'deploy:login';
 
 /**
  * Build the deploy configuration dialog body.
@@ -24,6 +27,11 @@ function createDeployDialogBody(): HTMLElement {
   const body = document.createElement('div');
   body.classList.add('jl-deploy-dialog');
   body.innerHTML = `
+    <label for="jl-deploy-proxy">CORS Proxy URL</label>
+    <input id="jl-deploy-proxy" type="text"
+           placeholder="https://your-worker.workers.dev"
+           value="${localStorage.getItem('jl-deploy-proxy') ?? ''}" />
+
     <label for="jl-deploy-repo">Repository URL</label>
     <input id="jl-deploy-repo" type="text"
            placeholder="https://github.com/user/repo.git"
@@ -34,9 +42,13 @@ function createDeployDialogBody(): HTMLElement {
            value="${localStorage.getItem('jl-deploy-branch') || 'gh-pages'}" />
 
     <label for="jl-deploy-token">GitHub Token</label>
-    <input id="jl-deploy-token" type="password"
-           placeholder="ghp_…"
-           value="${sessionStorage.getItem('jl-deploy-token') ?? ''}" />
+    <div style="display: flex; gap: 4px;">
+      <input id="jl-deploy-token" type="password" style="flex: 1;"
+             placeholder="ghp_… or use Login button"
+             value="${sessionStorage.getItem('jl-deploy-token') ?? ''}" />
+      <button id="jl-deploy-oauth-btn" type="button"
+              style="white-space: nowrap; padding: 2px 8px;">Login with GitHub</button>
+    </div>
 
     <label for="jl-deploy-author">Author</label>
     <input id="jl-deploy-author" type="text"
@@ -47,6 +59,19 @@ function createDeployDialogBody(): HTMLElement {
     <input id="jl-deploy-message" type="text"
            value="Deploy JupyterLite site" />
   `;
+
+  // Wire up the OAuth login button
+  setTimeout(() => {
+    const btn = body.querySelector('#jl-deploy-oauth-btn') as HTMLButtonElement;
+    const tokenInput = body.querySelector('#jl-deploy-token') as HTMLInputElement;
+    const proxyInput = body.querySelector('#jl-deploy-proxy') as HTMLInputElement;
+    if (btn) {
+      btn.addEventListener('click', () => {
+        void doOAuthLogin(proxyInput.value.trim(), tokenInput);
+      });
+    }
+  }, 0);
+
   return body;
 }
 
@@ -62,6 +87,90 @@ function parseAuthor(raw: string): { name: string; email: string } {
 }
 
 /**
+ * Perform GitHub OAuth Device Flow login.
+ * Shows a dialog with the user code and verification URL,
+ * polls for the token, and fills the token input.
+ */
+async function doOAuthLogin(
+  proxyUrl: string,
+  tokenInput: HTMLInputElement,
+): Promise<void> {
+  if (!proxyUrl) {
+    await showDialog({
+      title: 'OAuth Login',
+      body: 'Please enter a CORS Proxy URL first.',
+      buttons: [Dialog.okButton()],
+    });
+    return;
+  }
+
+  try {
+    const oauthConfig = { proxyUrl };
+    const { device_code, user_code, verification_uri, expires_in, interval } =
+      await requestDeviceCode(oauthConfig);
+
+    const msgNode = document.createElement('div');
+    msgNode.innerHTML = `
+      <p>Go to <a href="${verification_uri}" target="_blank" rel="noopener">
+      ${verification_uri}</a> and enter this code:</p>
+      <pre style="font-size: 1.5em; text-align: center; letter-spacing: 0.15em;
+                  background: var(--jp-layout-color2); padding: 12px; border-radius: 4px;
+                  user-select: all;">${user_code}</pre>
+      <p id="jl-oauth-status" style="font-size: 0.85em; color: var(--jp-ui-font-color2);">
+        Waiting for authorization…</p>
+    `;
+
+    const controller = new AbortController();
+
+    // Show the dialog (non-blocking — user can cancel)
+    const dialogPromise = showDialog({
+      title: 'GitHub Device Login',
+      body: new Widget({ node: msgNode }),
+      buttons: [
+        Dialog.cancelButton({ label: 'Cancel' }),
+      ],
+    });
+
+    // When dialog is dismissed, abort polling
+    dialogPromise.then(() => controller.abort()).catch(() => controller.abort());
+
+    const statusEl = msgNode.querySelector('#jl-oauth-status');
+
+    const result = await pollForToken(
+      oauthConfig,
+      device_code,
+      interval,
+      expires_in,
+      (msg: string) => {
+        if (statusEl) {
+          statusEl.textContent = msg;
+        }
+      },
+      controller.signal,
+    );
+
+    if (result) {
+      cacheToken(result.access_token);
+      tokenInput.value = result.access_token;
+      if (statusEl) {
+        statusEl.textContent = 'Logged in successfully!';
+      }
+      // Dismiss the dialog after a short delay
+      await new Promise(r => setTimeout(r, 800));
+      Dialog.flush();
+    }
+  } catch (err: any) {
+    if (err.name !== 'AbortError') {
+      await showDialog({
+        title: 'OAuth Error',
+        body: String(err.message || err),
+        buttons: [Dialog.okButton()],
+      });
+    }
+  }
+}
+
+/**
  * Extension activation.
  */
 const plugin: JupyterFrontEndPlugin<void> = {
@@ -73,7 +182,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
     console.log('jupyterlite-deploy: activated');
 
     app.commands.addCommand(CMD_DEPLOY, {
-      label: 'Deploy to GitHub Pages',
+      label: 'Wiki3.ai Sync: Deploy to GitHub Pages',
       caption: 'Push site contents to a gh-pages branch via isomorphic-git',
       execute: async () => {
         // ── 1. Show config dialog ────────────────────────────────────
@@ -106,6 +215,9 @@ const plugin: JupyterFrontEndPlugin<void> = {
         const message = (
           body.querySelector('#jl-deploy-message') as HTMLInputElement
         ).value.trim();
+        const proxyUrl = (
+          body.querySelector('#jl-deploy-proxy') as HTMLInputElement
+        ).value.trim();
 
         if (!repoUrl || !token) {
           void showDialog({
@@ -120,6 +232,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
         localStorage.setItem('jl-deploy-repo', repoUrl);
         localStorage.setItem('jl-deploy-branch', branch);
         localStorage.setItem('jl-deploy-author', authorRaw);
+        if (proxyUrl) localStorage.setItem('jl-deploy-proxy', proxyUrl);
         // Token goes to sessionStorage (cleared when tab closes)
         sessionStorage.setItem('jl-deploy-token', token);
 
@@ -158,6 +271,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
             message: message || 'Deploy JupyterLite site',
             authorName,
             authorEmail,
+            proxyUrl: proxyUrl || getProxyUrl(),
             onProgress: log,
           });
 
@@ -189,7 +303,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
 
     // ── Sync from Repository command ───────────────────────────────
     app.commands.addCommand(CMD_SYNC, {
-      label: 'Sync Files from Repository',
+      label: 'Wiki3.ai Sync: Pull from Repository',
       caption: 'Pull latest content files from a git branch into JupyterLite',
       execute: async () => {
         const syncBody = createSyncDialogBody();
@@ -218,6 +332,9 @@ const plugin: JupyterFrontEndPlugin<void> = {
         const contentPath = (
           syncBody.querySelector('#jl-sync-path') as HTMLInputElement
         ).value.trim();
+        const proxyUrl = (
+          syncBody.querySelector('#jl-sync-proxy') as HTMLInputElement
+        ).value.trim();
 
         if (!repoUrl) {
           void showDialog({
@@ -232,6 +349,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
         localStorage.setItem('jl-deploy-repo', repoUrl);
         localStorage.setItem('jl-sync-branch', branch);
         localStorage.setItem('jl-sync-path', contentPath);
+        if (proxyUrl) localStorage.setItem('jl-deploy-proxy', proxyUrl);
         if (token) {
           sessionStorage.setItem('jl-deploy-token', token);
         }
@@ -261,6 +379,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
               branch: branch || 'gh-pages',
               token,
               contentPath,
+              proxyUrl: proxyUrl || getProxyUrl(),
               onProgress: log,
             }
           );
@@ -287,13 +406,49 @@ const plugin: JupyterFrontEndPlugin<void> = {
       },
     });
 
-    // Add both commands to the command palette
+    // Login command (standalone OAuth flow)
+    app.commands.addCommand(CMD_LOGIN, {
+      label: 'Wiki3.ai Sync: Login with GitHub',
+      caption: 'Authenticate with GitHub using the OAuth Device Flow',
+      execute: async () => {
+        const proxyUrl = getProxyUrl() || '';
+        const node = document.createElement('div');
+        node.innerHTML = `
+          <label for="jl-login-proxy">CORS Proxy URL</label>
+          <input id="jl-login-proxy" type="text"
+                 placeholder="https://your-worker.workers.dev"
+                 value="${proxyUrl}" />
+        `;
+        const result = await showDialog({
+          title: 'GitHub OAuth Login',
+          body: new Widget({ node }),
+          buttons: [Dialog.cancelButton(), Dialog.okButton({ label: 'Login' })],
+        });
+        if (!result.button.accept) {
+          return;
+        }
+        const proxy = (node.querySelector('#jl-login-proxy') as HTMLInputElement).value.trim();
+        if (proxy) {
+          localStorage.setItem('jl-deploy-proxy', proxy);
+        }
+        // Create a hidden dummy input to receive the token
+        const dummyInput = document.createElement('input');
+        dummyInput.type = 'hidden';
+        await doOAuthLogin(proxy, dummyInput);
+        if (dummyInput.value) {
+          console.log('jupyterlite-deploy: OAuth login successful');
+        }
+      },
+    });
+
+    // Add all commands to the command palette
     if (palette) {
-      palette.addItem({ command: CMD_DEPLOY, category: 'Deploy' });
-      palette.addItem({ command: CMD_SYNC, category: 'Deploy' });
+      palette.addItem({ command: CMD_DEPLOY, category: 'Wiki3.ai Sync' });
+      palette.addItem({ command: CMD_SYNC, category: 'Wiki3.ai Sync' });
+      palette.addItem({ command: CMD_LOGIN, category: 'Wiki3.ai Sync' });
     }
 
-    console.log('jupyterlite-deploy: commands registered', CMD_DEPLOY, CMD_SYNC);
+    console.log('jupyterlite-deploy: commands registered', CMD_DEPLOY, CMD_SYNC, CMD_LOGIN);
   },
 };
 
@@ -306,6 +461,11 @@ function createSyncDialogBody(): HTMLElement {
   const body = document.createElement('div');
   body.classList.add('jl-deploy-dialog');
   body.innerHTML = `
+    <label for="jl-sync-proxy">CORS Proxy URL</label>
+    <input id="jl-sync-proxy" type="text"
+           placeholder="https://your-worker.workers.dev"
+           value="${localStorage.getItem('jl-deploy-proxy') ?? ''}" />
+
     <label for="jl-sync-repo">Repository URL</label>
     <input id="jl-sync-repo" type="text"
            placeholder="https://github.com/user/repo.git"
@@ -316,9 +476,13 @@ function createSyncDialogBody(): HTMLElement {
            value="${localStorage.getItem('jl-sync-branch') || 'gh-pages'}" />
 
     <label for="jl-sync-token">GitHub Token (optional for public repos)</label>
-    <input id="jl-sync-token" type="password"
-           placeholder="ghp_… (leave empty for public repos)"
-           value="${sessionStorage.getItem('jl-deploy-token') ?? ''}" />
+    <div style="display: flex; gap: 4px;">
+      <input id="jl-sync-token" type="password" style="flex: 1;"
+             placeholder="ghp_… (leave empty for public repos)"
+             value="${sessionStorage.getItem('jl-deploy-token') ?? ''}" />
+      <button id="jl-sync-oauth-btn" type="button"
+              style="white-space: nowrap; padding: 2px 8px;">Login with GitHub</button>
+    </div>
 
     <label for="jl-sync-path">Content subdirectory (optional)</label>
     <input id="jl-sync-path" type="text"
@@ -330,5 +494,18 @@ function createSyncDialogBody(): HTMLElement {
       JupyterLite file system, replacing any stale cached versions.
     </p>
   `;
+
+  // Wire up OAuth login button
+  setTimeout(() => {
+    const btn = body.querySelector('#jl-sync-oauth-btn') as HTMLButtonElement;
+    const tokenInput = body.querySelector('#jl-sync-token') as HTMLInputElement;
+    const proxyInput = body.querySelector('#jl-sync-proxy') as HTMLInputElement;
+    if (btn) {
+      btn.addEventListener('click', () => {
+        void doOAuthLogin(proxyInput.value.trim(), tokenInput);
+      });
+    }
+  }, 0);
+
   return body;
 }

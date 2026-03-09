@@ -4,7 +4,7 @@
  */
 
 import git from 'isomorphic-git';
-import http from 'isomorphic-git/http/web';
+import { makeProxyHttp } from './proxy-http';
 import { MemFS } from './memfs';
 import { Contents } from '@jupyterlab/services';
 
@@ -14,7 +14,7 @@ export interface IDeployOptions {
   repoUrl: string;
   /** Branch to push to (default: gh-pages) */
   branch: string;
-  /** GitHub Personal Access Token (fine-grained or classic, needs Contents: write) */
+  /** GitHub Personal Access Token or OAuth token */
   token: string;
   /** Commit message */
   message: string;
@@ -22,6 +22,8 @@ export interface IDeployOptions {
   authorName: string;
   /** Author email */
   authorEmail: string;
+  /** Base URL of the CORS proxy worker (empty = direct) */
+  proxyUrl?: string;
   /** Optional progress callback */
   onProgress?: (msg: string) => void;
 }
@@ -51,10 +53,12 @@ export async function deployToGitHub(
     message,
     authorName,
     authorEmail,
+    proxyUrl,
     onProgress,
   } = options;
 
   const log = (msg: string) => onProgress?.(msg);
+  const http = makeProxyHttp(proxyUrl);
   const fs = new MemFS();
   const dir = '/repo';
 
@@ -203,6 +207,8 @@ export interface ISyncOptions {
   token: string;
   /** Only sync files under this subdirectory (e.g. "files") — empty = all */
   contentPath: string;
+  /** Base URL of the CORS proxy worker (empty = direct) */
+  proxyUrl?: string;
   /** Progress callback */
   onProgress?: (msg: string) => void;
 }
@@ -217,9 +223,10 @@ export async function syncFromRepo(
   contentsManager: Contents.IManager,
   options: ISyncOptions
 ): Promise<{ updated: number; total: number }> {
-  const { repoUrl, branch, token, contentPath, onProgress } = options;
+  const { repoUrl, branch, token, contentPath, proxyUrl, onProgress } = options;
   const log = (msg: string) => onProgress?.(msg);
 
+  const http = makeProxyHttp(proxyUrl);
   const fs = new MemFS();
   const dir = '/repo';
 
