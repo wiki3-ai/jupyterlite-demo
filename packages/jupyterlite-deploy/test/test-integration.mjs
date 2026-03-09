@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 /**
- * Integration tests for the full sync pipeline via the live CORS proxy worker.
+ * Integration tests for the full sync + deploy pipeline via the live CORS proxy.
  *
  * Tests:
  *   1. Worker health check & OAuth config
  *   2. OAuth Device Flow — request device code
  *   3. OAuth token poll — gets authorization_pending (no human interaction)
- *   4. Git clone via proxy (public repo, no auth)
+ *   4. Git smart HTTP via proxy (raw fetch)
  *   5. MemFS + isomorphic-git clone via proxy (full pipeline)
  *   6. Sync simulation — clone + file extraction (mock ContentsManager)
- *   7. [Interactive] Full OAuth token exchange (requires human, skipped by default)
+ *   7. [Interactive] OAuth token exchange (requires human)
+ *   8. [Interactive] Deploy to test branch (full push pipeline)
+ *   9. [Interactive] Verify deploy — clone back and check files
+ *  10. [Interactive] Cleanup — delete test branch
  *
  * Usage:
  *   node test/test-integration.mjs                          # automated tests
- *   node test/test-integration.mjs --interactive             # include OAuth human step
+ *   node test/test-integration.mjs --interactive             # include OAuth + deploy
  *   PROXY_URL=https://... node test/test-integration.mjs     # custom worker
  *
  * Requires: Node.js 18+ (native fetch), built lib/ directory
@@ -29,7 +32,11 @@ const REPO_OWNER = 'wiki3-ai';
 const REPO_NAME = 'jupyterlite-demo';
 const REPO_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}.git`;
 const BRANCH = 'gh-pages';
+const TEST_BRANCH = 'test-deploy-integration';
 const INTERACTIVE = process.argv.includes('--interactive');
+
+// Shared state for interactive tests
+let oauthToken = null;
 
 // ─── Test harness ─────────────────────────────────────────────────────
 let passed = 0;
@@ -339,7 +346,6 @@ async function testInteractiveOAuth() {
 
   const deadline = Date.now() + codeData.expires_in * 1000;
   let pollInterval = Math.max(codeData.interval, 5) * 1000;
-  let token = null;
 
   while (Date.now() < deadline) {
     await sleep(pollInterval);
@@ -352,7 +358,7 @@ async function testInteractiveOAuth() {
     const tokenData = await tokenResp.json();
 
     if (tokenData.access_token) {
-      token = tokenData.access_token;
+      oauthToken = tokenData.access_token;
       break;
     }
 
@@ -369,35 +375,230 @@ async function testInteractiveOAuth() {
 
   console.log('');
 
-  if (token) {
-    assert(true, `Got access token (${token.slice(0, 8)}…)`);
-    assert(token.startsWith('gho_') || token.startsWith('ghp_') || token.length > 10,
+  if (oauthToken) {
+    assert(true, `Got access token (${oauthToken.slice(0, 8)}…)`);
+    assert(oauthToken.startsWith('gho_') || oauthToken.startsWith('ghp_') || oauthToken.length > 10,
       `Token looks like a GitHub token`);
 
     // Verify token works: fetch user info
     const userResp = await fetch('https://api.github.com/user', {
-      headers: { 'Authorization': `Bearer ${token}` },
+      headers: { 'Authorization': `Bearer ${oauthToken}` },
     });
     const userData = await userResp.json();
     assert(userResp.ok, `Token is valid (user: ${userData.login})`);
-
-    // Try an authenticated clone
-    const proxyHttp = makeProxyHttp(PROXY_URL);
-    const fs = new MemFS();
-    await git.clone({
-      fs,
-      http: proxyHttp,
-      dir: '/auth-repo',
-      url: REPO_URL,
-      ref: BRANCH,
-      singleBranch: true,
-      depth: 1,
-      onAuth: () => ({ username: 'x-access-token', password: token }),
-    });
-    const entries = await fs.promises.readdir('/auth-repo');
-    assert(entries.length > 0, `Authenticated clone succeeded (${entries.length} entries)`);
   } else {
     assert(false, 'Did not receive access token (timed out or denied)');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 8: [Interactive] Deploy to test branch (full push pipeline)
+//
+// This replicates the EXACT code path from deploy.ts:
+//   init → addRemote → write files → listAllFiles → stage → commit → push
+// ═══════════════════════════════════════════════════════════════════════
+async function testDeploy() {
+  console.log('\n8. [Interactive] Deploy to test branch');
+
+  if (!INTERACTIVE || !oauthToken) {
+    skip('Requires --interactive and successful OAuth (test 7)');
+    return;
+  }
+
+  const proxyHttp = makeProxyHttp(PROXY_URL);
+  const fs = new MemFS();
+  const dir = '/deploy-repo';
+  const timestamp = new Date().toISOString();
+
+  // ── Exactly replicate deploy.ts flow ──────────────────────────────
+
+  // 1. Init
+  await git.init({ fs, dir });
+  assert(true, 'git.init succeeded');
+
+  // 2. Add remote
+  await git.addRemote({ fs, dir, remote: 'origin', url: REPO_URL });
+
+  // 3. Write test files (simulating collectContentsFiles output)
+  const testFiles = [
+    { path: 'index.html', content: `<html><body><h1>Deploy test ${timestamp}</h1></body></html>` },
+    { path: 'files/test.txt', content: `Integration test at ${timestamp}` },
+    { path: 'files/data/sample.csv', content: 'name,value\nalpha,1\nbeta,2' },
+    { path: 'files/notebook.ipynb', content: JSON.stringify({
+      cells: [{ cell_type: 'markdown', source: ['# Test notebook'], metadata: {} }],
+      metadata: { kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' } },
+      nbformat: 4, nbformat_minor: 5,
+    }, null, 2) },
+  ];
+
+  for (const file of testFiles) {
+    const parts = file.path.split('/');
+    let cur = dir;
+    for (let i = 0; i < parts.length - 1; i++) {
+      cur += '/' + parts[i];
+      try { await fs.promises.mkdir(cur); } catch { /* exists */ }
+    }
+    await fs.promises.writeFile(dir + '/' + file.path, new TextEncoder().encode(file.content));
+  }
+  await fs.promises.writeFile(dir + '/.nojekyll', new Uint8Array(0));
+  assert(true, `Wrote ${testFiles.length} test files + .nojekyll`);
+
+  // 4. List all files (THIS is where the .git bug lived)
+  const allPaths = await listAllFiles(fs, dir, '');
+
+  // CRITICAL CHECK: no .git paths should be staged
+  const dotgitPaths = allPaths.filter(p => p === '.git' || p.startsWith('.git/'));
+  assert(dotgitPaths.length === 0,
+    `No .git paths in staging list (would cause "hasDotgit" push rejection)`);
+
+  // Verify expected files are present
+  assert(allPaths.includes('index.html'), 'index.html in staging list');
+  assert(allPaths.includes('.nojekyll'), '.nojekyll in staging list');
+  assert(allPaths.includes('files/test.txt'), 'files/test.txt in staging list');
+  assert(allPaths.includes('files/data/sample.csv'), 'files/data/sample.csv in staging list');
+  assert(allPaths.includes('files/notebook.ipynb'), 'files/notebook.ipynb in staging list');
+
+  // 5. Stage
+  for (const p of allPaths) {
+    await git.add({ fs, dir, filepath: p });
+  }
+  assert(true, `Staged ${allPaths.length} files`);
+
+  // 6. Commit
+  const sha = await git.commit({
+    fs, dir,
+    message: `Integration test deploy at ${timestamp}`,
+    author: { name: 'Integration Test', email: 'test@wiki3.ai' },
+  });
+  assert(typeof sha === 'string' && sha.length === 40, `Commit created: ${sha.slice(0, 8)}`);
+
+  // Verify committed tree is clean
+  const committedFiles = await git.listFiles({ fs, dir });
+  const dotgitInTree = committedFiles.filter(p => p === '.git' || p.startsWith('.git/'));
+  assert(dotgitInTree.length === 0, 'Committed tree has no .git entries');
+
+  // 7. Push to test branch
+  let pushError = null;
+  try {
+    await git.push({
+      fs, http: proxyHttp, dir,
+      remote: 'origin',
+      ref: 'HEAD',
+      remoteRef: `refs/heads/${TEST_BRANCH}`,
+      force: true,
+      onAuth: () => ({ username: 'x-access-token', password: oauthToken }),
+      onMessage: (msg) => console.log(`    remote: ${msg}`),
+    });
+  } catch (err) {
+    pushError = err;
+  }
+
+  assert(!pushError, pushError
+    ? `Push FAILED: ${pushError.message}`
+    : `Push to ${TEST_BRANCH} succeeded`);
+
+  console.log(`  (Deployed ${allPaths.length} files to ${TEST_BRANCH}, commit ${sha.slice(0, 8)})`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 9: [Interactive] Verify deploy — clone back and check files
+// ═══════════════════════════════════════════════════════════════════════
+async function testVerifyDeploy() {
+  console.log('\n9. [Interactive] Verify deploy — clone back and check files');
+
+  if (!INTERACTIVE || !oauthToken) {
+    skip('Requires --interactive and successful OAuth (test 7)');
+    return;
+  }
+
+  const proxyHttp = makeProxyHttp(PROXY_URL);
+  const fs = new MemFS();
+  const dir = '/verify-repo';
+
+  // Clone the test branch back
+  let cloneError = null;
+  try {
+    await git.clone({
+      fs, http: proxyHttp, dir,
+      url: REPO_URL,
+      ref: TEST_BRANCH,
+      singleBranch: true,
+      depth: 1,
+      onAuth: () => ({ username: 'x-access-token', password: oauthToken }),
+    });
+  } catch (err) {
+    cloneError = err;
+  }
+  assert(!cloneError, cloneError
+    ? `Clone of ${TEST_BRANCH} failed: ${cloneError.message}`
+    : `Cloned ${TEST_BRANCH} successfully`);
+
+  if (cloneError) return;
+
+  // Check expected files exist
+  const entries = await fs.promises.readdir(dir);
+  assert(entries.includes('index.html'), 'index.html exists in clone');
+  assert(entries.includes('.nojekyll'), '.nojekyll exists in clone');
+  assert(entries.includes('files'), 'files/ directory exists in clone');
+
+  // Verify file contents
+  const indexContent = new TextDecoder().decode(await fs.promises.readFile(dir + '/index.html'));
+  assert(indexContent.includes('Deploy test'), 'index.html contains deploy test marker');
+
+  const testTxt = new TextDecoder().decode(await fs.promises.readFile(dir + '/files/test.txt'));
+  assert(testTxt.includes('Integration test at'), 'files/test.txt has expected content');
+
+  const csv = new TextDecoder().decode(await fs.promises.readFile(dir + '/files/data/sample.csv'));
+  assert(csv.includes('alpha,1'), 'files/data/sample.csv has expected data');
+
+  const nbRaw = new TextDecoder().decode(await fs.promises.readFile(dir + '/files/notebook.ipynb'));
+  const nb = JSON.parse(nbRaw);
+  assert(nb.nbformat === 4, 'notebook.ipynb is valid nbformat 4');
+  assert(nb.cells[0].source[0] === '# Test notebook', 'notebook cell content matches');
+
+  // Verify git history
+  const log = await git.log({ fs, dir, depth: 1 });
+  assert(log[0].commit.message.startsWith('Integration test deploy at'),
+    `Commit message matches (${log[0].commit.message.trim().slice(0, 40)}…)`);
+  assert(log[0].commit.author.name === 'Integration Test',
+    'Commit author is "Integration Test"');
+
+  // Verify NO .git entries leaked into the tree
+  const treeFiles = await git.listFiles({ fs, dir });
+  const dotgitLeaks = treeFiles.filter(p => p.startsWith('.git/'));
+  assert(dotgitLeaks.length === 0,
+    `No .git entries in remote tree (the hasDotgit bug is fixed)`);
+
+  console.log(`  (Verified ${treeFiles.length} files in ${TEST_BRANCH})`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 10: [Interactive] Cleanup — delete test branch via GitHub API
+// ═══════════════════════════════════════════════════════════════════════
+async function testCleanup() {
+  console.log('\n10. [Interactive] Cleanup — delete test branch');
+
+  if (!INTERACTIVE || !oauthToken) {
+    skip('Requires --interactive and successful OAuth (test 7)');
+    return;
+  }
+
+  const resp = await fetch(
+    `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/git/refs/heads/${TEST_BRANCH}`,
+    {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${oauthToken}` },
+    }
+  );
+
+  if (resp.status === 204 || resp.status === 200) {
+    assert(true, `Deleted test branch ${TEST_BRANCH}`);
+  } else if (resp.status === 422 || resp.status === 404) {
+    // Branch doesn't exist or already deleted
+    assert(true, `Test branch ${TEST_BRANCH} already cleaned up (${resp.status})`);
+  } else {
+    const body = await resp.text();
+    assert(false, `Failed to delete test branch (${resp.status}): ${body}`);
   }
 }
 
@@ -412,6 +613,8 @@ async function listAllFiles(fs, dir, prefix) {
   const entries = await fs.promises.readdir(prefix ? `${dir}/${prefix}` : dir);
   const result = [];
   for (const name of entries) {
+    // Must skip .git — same filter as deploy.ts
+    if (name === '.git') continue;
     const rel = prefix ? `${prefix}/${name}` : name;
     const full = `${dir}/${rel}`;
     const stat = await fs.promises.stat(full);
@@ -442,6 +645,9 @@ async function main() {
   await testCloneViaProxy();
   await testSyncSimulation();
   await testInteractiveOAuth();
+  await testDeploy();
+  await testVerifyDeploy();
+  await testCleanup();
 
   console.log('\n═══════════════════════════════════════════════════════════');
   console.log(`  Results: ${passed} passed, ${failed} failed, ${skipped} skipped`);

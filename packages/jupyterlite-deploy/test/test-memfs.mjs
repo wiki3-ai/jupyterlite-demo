@@ -260,6 +260,112 @@ console.log('\n=== Test 8: Multiple files and nested dirs in a commit ===');
   assert(readBack === 'a,b\n1,2', 'nested file content preserved');
 }
 
+// ── Test 9: Deploy staging must exclude .git directory ────────────────
+// GitHub rejects pushes with '.git' in the tree:
+//   error: object ...: hasDotgit: contains '.git'
+//   fatal: fsck error in packed object
+console.log('\n=== Test 9: Deploy staging excludes .git directory ===');
+{
+  const fs = new MemFS();
+  const dir = '/repo';
+
+  // Replicate the deploy flow: init creates .git, then write user files
+  await git.init({ fs, dir });
+  await fs.writeFile(dir + '/index.html', new TextEncoder().encode('<h1>Site</h1>'));
+  await fs.writeFile(dir + '/.nojekyll', new Uint8Array(0));
+  await fs.mkdir(dir + '/files');
+  await fs.writeFile(dir + '/files/notebook.ipynb', new TextEncoder().encode('{}'));
+
+  // Verify .git exists in the MemFS (git.init created it)
+  const rootEntries = await fs.readdir(dir);
+  assert(rootEntries.includes('.git'), '.git exists after git.init (precondition)');
+
+  // listAllFiles is private in deploy.ts — replicate it here to test the filter
+  async function listAllFiles(fsArg, dirArg, prefix) {
+    const entries = await fsArg.readdir(prefix ? dirArg + '/' + prefix : dirArg);
+    const result = [];
+    for (const name of entries) {
+      if (name === '.git') continue;  // THE FIX UNDER TEST
+      const rel = prefix ? prefix + '/' + name : name;
+      const full = dirArg + '/' + rel;
+      const stat = await fsArg.stat(full);
+      if (stat.isDirectory()) {
+        result.push(...(await listAllFiles(fsArg, dirArg, rel)));
+      } else {
+        result.push(rel);
+      }
+    }
+    return result;
+  }
+
+  const allPaths = await listAllFiles(fs, dir, '');
+
+  // CRITICAL: no path should contain .git
+  const dotgitPaths = allPaths.filter(p => p === '.git' || p.startsWith('.git/'));
+  assert(dotgitPaths.length === 0,
+    `No .git paths in staging list (found ${dotgitPaths.length}: ${dotgitPaths.slice(0, 3).join(', ')})`);
+
+  // Verify user files ARE included
+  assert(allPaths.includes('index.html'), 'index.html is staged');
+  assert(allPaths.includes('.nojekyll'), '.nojekyll is staged');
+  assert(allPaths.includes('files/notebook.ipynb'), 'files/notebook.ipynb is staged');
+
+  // The full deploy: stage, commit, verify the tree is clean
+  for (const p of allPaths) {
+    await git.add({ fs, dir, filepath: p });
+  }
+  const sha = await git.commit({
+    fs, dir,
+    message: 'Test deploy (no .git in tree)',
+    author: { name: 'Test', email: 'test@test.com' },
+  });
+  assert(typeof sha === 'string' && sha.length === 40, 'Commit with filtered tree succeeds');
+
+  // Verify the committed tree does NOT contain .git entries
+  const tree = await git.listFiles({ fs, dir });
+  const dotgitInTree = tree.filter(p => p === '.git' || p.startsWith('.git/'));
+  assert(dotgitInTree.length === 0,
+    `Committed tree has no .git entries (found ${dotgitInTree.length})`);
+
+  console.log(`  (Staged ${allPaths.length} files, committed ${sha.slice(0, 8)})`);
+}
+
+// ── Test 10: Prove .git WOULD be staged without the filter ────────────
+// This test proves the bug exists if the filter is removed.
+console.log('\n=== Test 10: Without .git filter, .git IS staged (regression proof) ===');
+{
+  const fs = new MemFS();
+  const dir = '/repo';
+
+  await git.init({ fs, dir });
+  await fs.writeFile(dir + '/index.html', new TextEncoder().encode('<h1>Site</h1>'));
+
+  // listAllFiles WITHOUT the .git filter — simulates the buggy version
+  async function listAllFilesUnfiltered(fsArg, dirArg, prefix) {
+    const entries = await fsArg.readdir(prefix ? dirArg + '/' + prefix : dirArg);
+    const result = [];
+    for (const name of entries) {
+      // NO .git filter here — this is the bug
+      const rel = prefix ? prefix + '/' + name : name;
+      const full = dirArg + '/' + rel;
+      const stat = await fsArg.stat(full);
+      if (stat.isDirectory()) {
+        result.push(...(await listAllFilesUnfiltered(fsArg, dirArg, rel)));
+      } else {
+        result.push(rel);
+      }
+    }
+    return result;
+  }
+
+  const unfilteredPaths = await listAllFilesUnfiltered(fs, dir, '');
+  const dotgitPaths = unfilteredPaths.filter(p => p === '.git' || p.startsWith('.git/'));
+
+  assert(dotgitPaths.length > 0,
+    `Without filter, .git entries ARE present (${dotgitPaths.length} found) — proves the bug is real`);
+  console.log(`  (Unfiltered: ${unfilteredPaths.length} total, ${dotgitPaths.length} .git entries)`);
+}
+
 // ── Summary ───────────────────────────────────────────────────────────
 console.log(`\n${'='.repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

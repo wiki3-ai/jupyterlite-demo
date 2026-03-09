@@ -137,6 +137,8 @@ async function listAllFiles(
   )) as string[];
   const result: string[] = [];
   for (const name of entries) {
+    // Skip .git internals — GitHub rejects trees containing '.git'
+    if (name === '.git') continue;
     const rel = prefix ? prefix + '/' + name : name;
     const full = dir + '/' + rel;
     const stat = (await fs.promises.stat(full)) as { isDirectory(): boolean };
